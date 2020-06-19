@@ -2,6 +2,7 @@ import { execSync } from 'child_process';
 import { ExtensionContext, LanguageClient, LanguageClientOptions, ServerOptions, services, workspace, WorkspaceConfiguration } from 'coc.nvim';
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
 import { NotificationType } from 'vscode-languageserver-protocol';
 import which from 'which';
 
@@ -29,8 +30,17 @@ class Config {
 
 export class Ctx {
   public readonly config: Config;
+  private lsProj: string;
+  private mainJulia: string;
+  private serverRoot: string;
   constructor(private readonly context: ExtensionContext) {
     this.config = new Config();
+    this.lsProj = path.join(context.extensionPath, 'server', 'languageserver');
+    this.mainJulia = path.join(context.extensionPath, 'server', 'main.jl');
+    this.serverRoot = context.storagePath;
+    if (!fs.existsSync(this.serverRoot)) {
+      fs.mkdirSync(this.serverRoot)
+    }
   }
 
   resolveJuliaBin(): string | null {
@@ -46,48 +56,51 @@ export class Ctx {
     return which.sync(cmd, { nothrow: true });
   }
 
-  async resolveMissingPkgs(): Promise<string[]> {
-    const bin = this.resolveJuliaBin();
-    const installed = execSync(`${bin!} -e "using Pkg; Pkg.status()"`)
+  private async resolveMissingPkgs(): Promise<void> {
+    const bin = this.resolveJuliaBin()!;
+    const installed = execSync(`${bin} --project="${this.lsProj}" --startup-file=no --history-file=no -e "using Pkg; Pkg.status()"`)
       .toString()
       .split('\n');
 
-    const missing: string[] = [];
     const pkgs = ['LanguageServer', 'StaticLint', 'SymbolServer'];
     for (const p of pkgs) {
       if (installed.some((s) => s.includes(p))) {
         continue;
       }
-      missing.push(p);
-    }
 
-    return missing;
+      workspace.showMessage(`Pkg.add ${p}`);
+      execSync(`${bin} --project="${this.lsProj}" --startup-file=no --history-file=no -e "using Pkg; Pkg.add(\\"${p}\\");"`);
+    }
   }
 
-  async resolveEnvPath() {
+  private async resolveEnvPath() {
     if (this.config.environmentPath) {
       return this.config.environmentPath;
     }
 
-    const bin = this.resolveJuliaBin();
-    return execSync(`${bin!} --startup-file=no --history-file=no -e "using Pkg; println(dirname(Pkg.Types.Context().env.project_file))"`)
+    const bin = this.resolveJuliaBin()!;
+    return execSync(`${bin} --project="." --startup-file=no --history-file=no -e "using Pkg; println(dirname(Pkg.Types.Context().env.project_file))"`)
       .toString()
       .trim();
   }
 
   async startServer() {
+    await this.resolveMissingPkgs()
     const env = await this.resolveEnvPath();
-    const bin = this.resolveJuliaBin();
+    const bin = this.resolveJuliaBin()!;
     const args = [
       '--startup-file=no',
       '--history-file=no',
       '--depwarn=no',
-      '--eval',
-      `using LanguageServer; import StaticLint; import SymbolServer; server = LanguageServer.LanguageServerInstance(stdin, stdout, "${env}"); server.runlinter = true; run(server);`,
+      `--project=${this.lsProj}`,
+      this.mainJulia,
+      env,
+      '--debug=no',
+      this.serverRoot
     ];
 
     const outputChannel = workspace.createOutputChannel('Julia Language Server Trace');
-    const serverOptions: ServerOptions = { command: bin!, args };
+    const serverOptions: ServerOptions = { command: bin, args };
     const clientOptions: LanguageClientOptions = {
       documentSelector: ['julia', 'juliamarkdown'],
       initializationOptions: workspace.getConfiguration('julia'),
